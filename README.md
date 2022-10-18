@@ -1,0 +1,2 @@
+# Minimal GC for Rust
+A single threaded, mark and sweep, garbage collector for Rust (and other languages). This crates only provides minimal API and does not enforce safety. Users need to mark root objects manually.
