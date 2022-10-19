@@ -2,6 +2,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, HashMap, LinkedList, VecDeque},
     ffi::CString,
+    fmt::Formatter,
     hash::Hash,
     ops::Deref,
     rc::Rc,
@@ -44,11 +45,11 @@ pub type TraceFunc = fn(*mut u8);
 pub type DeleteFunc = fn(*mut u8);
 
 pub struct GcHeader {
+    pub(crate) data: *mut u8,
     pub(crate) next: *mut GcHeader,
     pub(crate) mark: bool,
     pub(crate) trace: TraceFunc,
     pub(crate) delete: DeleteFunc,
-    pub(crate) data: *mut u8,
 }
 pub struct GcObject<T> {
     pub(crate) header: GcHeader,
@@ -285,13 +286,19 @@ impl<T: Trace> Trace for &T {
 }
 impl<T: PartialEq> PartialEq for Gc<T> {
     fn eq(&self, other: &Self) -> bool {
-        self.inner == other.inner
+        self.as_ref() == other.as_ref()
     }
 }
 impl<T: Eq> Eq for Gc<T> {}
+use std::fmt::Debug;
+impl<T: Debug> Debug for Gc<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        self.as_ref().fmt(f)
+    }
+}
 impl<T: Hash> Hash for Gc<T> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.inner.hash(state);
+        self.as_ref().hash(state);
     }
 }
 
