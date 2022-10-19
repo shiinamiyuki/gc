@@ -1,11 +1,38 @@
 use std::{
     cell::{Cell, RefCell},
-    collections::VecDeque,
+    collections::{BTreeMap, HashMap, LinkedList, VecDeque},
+    ffi::CString,
+    ops::Deref,
+    rc::Rc,
 };
 
-#[derive(Clone, Copy)]
-pub struct Gc<T: Trace> {
+pub struct Gc<T> {
     pub(crate) inner: *mut GcObject<T>,
+}
+impl<T> Clone for Gc<T> {
+    fn clone(&self) -> Self {
+        Self { inner: self.inner }
+    }
+}
+impl<T> Copy for Gc<T> {}
+impl<T: Trace> Gc<T> {
+    pub fn new(value: T) -> Self {
+        gc_new(value)
+    }
+}
+impl<T> AsRef<T> for Gc<T> {
+    fn as_ref(&self) -> &T {
+        unsafe {
+            let inner = &*self.inner;
+            &inner.data
+        }
+    }
+}
+impl<T> Deref for Gc<T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        self.as_ref()
+    }
 }
 pub type TraceFunc = fn(*mut u8);
 pub type DeleteFunc = fn(*mut u8);
@@ -21,45 +48,50 @@ pub struct GcObject<T> {
     pub(crate) header: GcHeader,
     pub(crate) data: T,
 }
+
 pub trait Trace {
     fn trace(&self);
 }
-struct GcContext {
-    head: Cell<*mut GcHeader>,
-    queue: RefCell<VecDeque<*mut GcHeader>>,
+pub struct GcContext {
+    head: *mut GcHeader,
+    queue: VecDeque<*mut GcHeader>,
 }
 thread_local! {
-    static GC: GcContext = GcContext {
-        head: Cell::new(std::ptr::null_mut()),
-        queue: RefCell::new(VecDeque::new()),
-    };
+    static GC: Cell<*mut GcContext> = Cell::new(std::ptr::null_mut());
 }
-pub fn gc_alloc<T>(data: T, trace_fn: TraceFunc, delete_func: DeleteFunc) -> *mut GcObject<T> {
-    let gc_head = GC.with(|gc| gc.head.get());
+pub fn gc_alloc<T>(data: T, trace_fn: TraceFunc) -> *mut GcObject<T> {
     let object = Box::into_raw(Box::new(GcObject {
         header: GcHeader {
-            next: gc_head,
+            next: std::ptr::null_mut(),
             mark: false,
             trace: trace_fn,
-            delete: delete_func,
+            delete: delete_impl::<T>,
             data: std::ptr::null_mut(),
         },
         data,
     }));
     unsafe {
         (*object).header.data = (&mut (*object).data) as *mut T as *mut u8;
-        GC.with(|gc| gc.head.set(&mut (*object).header));
     }
 
     object
+}
+pub fn gc_append_object(object: *mut GcHeader) {
+    let mut gc = GC.with(|gc| unsafe { gc.get().as_mut().unwrap() });
+    unsafe {
+        (*object).next = gc.head;
+    }
+    gc.head = object;
 }
 fn trace_impl<T: Trace>(data: *mut u8) {
     let obj = unsafe { &*(data as *const T) };
     obj.trace();
 }
 fn delete_impl<T>(data: *mut u8) {
-    let obj = unsafe { Box::from_raw(data as *mut T) };
-    drop(obj);
+    unsafe {
+        let object = data as *mut GcObject<T>;
+        drop(Box::from_raw(object));
+    }
 }
 pub unsafe fn trace_object(header: *mut GcHeader) {
     let header = &mut *header;
@@ -67,44 +99,245 @@ pub unsafe fn trace_object(header: *mut GcHeader) {
         return;
     }
     header.mark = true;
-    GC.with(|gc| gc.queue.borrow_mut().push_back(header));
+    GC.with(|gc| {
+        let gc = gc.get().as_mut().unwrap();
+        gc.queue.push_back(header);
+    });
 }
 pub fn gc_new<T: Trace>(data: T) -> Gc<T> {
-    Gc {
-        inner: gc_alloc(data, trace_impl::<T>, delete_impl::<T>),
+    let object = gc_alloc(data, trace_impl::<T>);
+    unsafe {
+        gc_append_object(&mut (*object).header);
     }
+    Gc { inner: object }
 }
 pub fn mark_root<T: Trace>(gc: Gc<T>) {
     unsafe {
         let header = &mut (*gc.inner).header;
         if !header.mark {
             header.mark = true;
-            GC.with(|gc| gc.queue.borrow_mut().push_back(header));
+            GC.with(|gc| {
+                let gc = gc.get().as_mut().unwrap();
+                gc.queue.push_back(header);
+            });
         }
     }
 }
 pub unsafe fn clear_marks() {
-    GC.with(|gc| {
-        let mut header = gc.head.get();
-        while !header.is_null() {
-            (*header).mark = false;
-            header = (*header).next;
-        }
-    });
+    let gc = GC.with(|gc| gc.get().as_mut().unwrap());
+    let mut header = gc.head;
+    while !header.is_null() {
+        (*header).mark = false;
+        header = (*header).next;
+    }
 }
 pub unsafe fn collect() {
     GC.with(|gc| loop {
-        let mut queue = gc.queue.borrow_mut();
+        let queue = &mut gc.get().as_mut().unwrap().queue;
         if queue.is_empty() {
             break;
         }
         let header = queue.pop_front().unwrap();
         drop(queue);
         ((*header).trace)((*header).data);
-    })
+    });
+    let gc = GC.with(|gc| gc.get().as_mut().unwrap());
+    let mut cur = gc.head;
+    let mut prev: *mut GcHeader = std::ptr::null_mut();
+    while !cur.is_null() {
+        let next = (*cur).next;
+        if !(*cur).mark {
+            ((*cur).delete)(cur as *mut u8);
+            if let Some(prev) = prev.as_mut() {
+                (*prev).next = next;
+            } else {
+                gc.head = next;
+            }
+        } else {
+            prev = cur;
+        }
+        cur = next;
+    }
 }
 pub unsafe fn trace_and_collect(f: impl FnOnce()) {
     clear_marks();
     f();
     collect();
+}
+
+macro_rules! impl_trivial {
+    ($($t:ty),*) => {
+        $(
+            impl Trace for $t {
+                fn trace(&self) {}
+            }
+        )*
+    };
+}
+impl_trivial!(
+    bool,
+    u8,
+    u16,
+    u32,
+    u64,
+    i8,
+    i16,
+    i32,
+    i64,
+    f32,
+    f64,
+    char,
+    String,
+    CString,
+    ()
+);
+
+impl<T: Trace + Copy> Trace for Cell<T> {
+    fn trace(&self) {
+        self.get().trace();
+    }
+}
+impl<T: Trace> Trace for RefCell<T> {
+    fn trace(&self) {
+        self.borrow().trace();
+    }
+}
+impl<T: Trace> Trace for Vec<T> {
+    fn trace(&self) {
+        for item in self {
+            item.trace();
+        }
+    }
+}
+impl<T: Trace> Trace for LinkedList<T> {
+    fn trace(&self) {
+        for item in self {
+            item.trace();
+        }
+    }
+}
+impl<T: Trace> Trace for Box<T> {
+    fn trace(&self) {
+        self.as_ref().trace();
+    }
+}
+impl<T: Trace> Trace for Option<T> {
+    fn trace(&self) {
+        if let Some(item) = self {
+            item.trace();
+        }
+    }
+}
+impl<T: Trace> Trace for Rc<T> {
+    fn trace(&self) {
+        self.as_ref().trace();
+    }
+}
+impl Trace for &dyn Trace {
+    fn trace(&self) {
+        (*self).trace();
+    }
+}
+impl<K: Trace, V: Trace> Trace for HashMap<K, V> {
+    fn trace(&self) {
+        for (k, v) in self {
+            k.trace();
+            v.trace();
+        }
+    }
+}
+impl<K: Trace, V: Trace> Trace for BTreeMap<K, V> {
+    fn trace(&self) {
+        for (k, v) in self {
+            k.trace();
+            v.trace();
+        }
+    }
+}
+
+impl<T: Trace> Trace for Gc<T> {
+    fn trace(&self) {
+        unsafe {
+            trace_object(&mut (*self.inner).header);
+        }
+    }
+}
+
+pub fn create_context() -> *mut GcContext {
+    Box::into_raw(Box::new(GcContext {
+        head: std::ptr::null_mut(),
+        queue: VecDeque::new(),
+    }))
+}
+pub fn destroy_context() {
+    unsafe {
+        let context = Box::from_raw(context());
+        drop(context);
+        GC.with(|gc| {
+            gc.set(std::ptr::null_mut());
+        });
+    }
+}
+pub fn context() -> *mut GcContext {
+    GC.with(|gc| gc.get())
+}
+pub fn init_context(ctx: *mut GcContext) {
+    GC.with(|gc| {
+        assert!(gc.get().is_null());
+        gc.set(ctx);
+    });
+}
+#[cfg(test)]
+mod test {
+    use super::*;
+    struct Foo {
+        data: Rc<Cell<usize>>,
+        next: Cell<Option<Gc<Foo>>>,
+    }
+    impl Trace for Foo {
+        fn trace(&self) {
+            self.next.trace();
+        }
+    }
+    impl Drop for Foo {
+        fn drop(&mut self) {
+            self.data.set(self.data.get() + 1);
+        }
+    }
+    #[test]
+    fn basic() {
+        init_context(create_context());
+        let data = Rc::new(Cell::new(0));
+        let foo = gc_new(Foo {
+            data: data.clone(),
+            next: Cell::new(None),
+        });
+        foo.next.set(Some(foo));
+        std::mem::drop(foo);
+        unsafe {
+            trace_and_collect(|| {});
+        }
+        assert_eq!(data.get(), 1);
+    }
+    #[test]
+    fn basic2() {
+        init_context(create_context());
+        let data = Rc::new(Cell::new(0));
+        let foo = gc_new(Foo {
+            data: data.clone(),
+            next: Cell::new(None),
+        });
+        let bar = gc_new(Foo {
+            data: data.clone(),
+            next: Cell::new(Some(foo)),
+        });
+        foo.next.set(Some(bar));
+        std::mem::drop(foo);
+        unsafe {
+            trace_and_collect(|| {
+                mark_root(foo);
+            });
+        }
+        assert_eq!(data.get(), 0);
+    }
 }
