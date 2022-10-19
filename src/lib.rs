@@ -262,6 +262,16 @@ impl<T: Trace> Trace for Gc<T> {
         }
     }
 }
+impl<T:Trace> Trace for &[T]{
+    fn trace(&self) {
+        self.iter().for_each(|item| item.trace());
+    }
+}
+impl<T:Trace> Trace for &mut [T]{
+    fn trace(&self) {
+        self.iter().for_each(|item| item.trace());
+    }
+}
 
 pub fn create_context() -> *mut GcContext {
     Box::into_raw(Box::new(GcContext {
