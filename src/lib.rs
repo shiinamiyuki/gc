@@ -2,6 +2,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, HashMap, LinkedList, VecDeque},
     ffi::CString,
+    hash::Hash,
     ops::Deref,
     rc::Rc,
 };
@@ -18,6 +19,11 @@ impl<T> Copy for Gc<T> {}
 impl<T: Trace> Gc<T> {
     pub fn new(value: T) -> Self {
         gc_new(value)
+    }
+}
+impl<T> Gc<T> {
+    pub fn eq(a: Self, b: Self) -> bool {
+        a.inner == b.inner
     }
 }
 impl<T> AsRef<T> for Gc<T> {
@@ -262,19 +268,30 @@ impl<T: Trace> Trace for Gc<T> {
         }
     }
 }
-impl<T:Trace> Trace for &[T]{
+impl<T: Trace> Trace for &[T] {
     fn trace(&self) {
         self.iter().for_each(|item| item.trace());
     }
 }
-impl<T:Trace> Trace for &mut [T]{
+impl<T: Trace> Trace for &mut [T] {
     fn trace(&self) {
         self.iter().for_each(|item| item.trace());
     }
 }
-impl<T:Trace> Trace for &T{
+impl<T: Trace> Trace for &T {
     fn trace(&self) {
         (*self).trace();
+    }
+}
+impl<T: PartialEq> PartialEq for Gc<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner == other.inner
+    }
+}
+impl<T: Eq> Eq for Gc<T> {}
+impl<T: Hash> Hash for Gc<T> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.inner.hash(state);
     }
 }
 
