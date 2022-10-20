@@ -26,6 +26,9 @@ impl<T> Gc<T> {
     pub fn eq(a: Self, b: Self) -> bool {
         a.inner == b.inner
     }
+    pub unsafe fn as_mut(gc:&Gc<T>) -> &mut T {
+        &mut (*gc.inner).data
+    }
 }
 impl<T> AsRef<T> for Gc<T> {
     fn as_ref(&self) -> &T {
