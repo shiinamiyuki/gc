@@ -291,6 +291,8 @@ impl<T: PartialEq> PartialEq for Gc<T> {
 }
 impl<T: Eq> Eq for Gc<T> {}
 use std::fmt::Debug;
+
+use serde::{Serialize, Serializer};
 impl<T: Debug> Debug for Gc<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         self.as_ref().fmt(f)
@@ -301,7 +303,14 @@ impl<T: Hash> Hash for Gc<T> {
         self.as_ref().hash(state);
     }
 }
-
+impl<T:Serialize> Serialize for Gc<T>{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.as_ref().serialize(serializer)
+    }
+}
 pub fn create_context() -> *mut GcContext {
     Box::into_raw(Box::new(GcContext {
         head: std::ptr::null_mut(),
@@ -329,6 +338,7 @@ pub fn init_context(ctx: *mut GcContext) {
 #[cfg(test)]
 mod test {
     use super::*;
+    #[derive(Debug)]
     struct Foo {
         data: Rc<Cell<usize>>,
         next: Cell<Option<Gc<Foo>>>,
@@ -356,7 +366,7 @@ mod test {
         unsafe {
             trace_and_collect(|| {});
         }
-        assert_eq!(data.get(), 1);
+        assert_eq!(data.get(), 1, "{:?}", foo);
     }
     #[test]
     fn basic2() {
@@ -371,7 +381,6 @@ mod test {
             next: Cell::new(Some(foo)),
         });
         foo.next.set(Some(bar));
-        std::mem::drop(foo);
         unsafe {
             trace_and_collect(|| {
                 mark_root(foo);
