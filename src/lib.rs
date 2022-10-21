@@ -47,13 +47,15 @@ impl<T> Deref for Gc<T> {
 pub type TraceFunc = fn(*mut u8);
 pub type DeleteFunc = fn(*mut u8);
 
+#[repr(C)]
 pub struct GcHeader {
     pub(crate) data: *mut u8,
     pub(crate) next: *mut GcHeader,
-    pub(crate) mark: bool,
     pub(crate) trace: TraceFunc,
     pub(crate) delete: DeleteFunc,
+    pub(crate) mark: bool,
 }
+#[repr(C)]
 pub struct GcObject<T> {
     pub(crate) header: GcHeader,
     pub(crate) data: T,
