@@ -7,7 +7,7 @@ use std::{
     ops::Deref,
     rc::Rc,
 };
-
+#[repr(C)]
 pub struct Gc<T> {
     pub(crate) inner: *mut GcObject<T>,
 }
