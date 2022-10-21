@@ -26,7 +26,7 @@ impl<T> Gc<T> {
     pub fn eq(a: Self, b: Self) -> bool {
         a.inner == b.inner
     }
-    pub unsafe fn get_mut(gc:&Gc<T>) -> &mut T {
+    pub unsafe fn get_mut(gc: &Gc<T>) -> &mut T {
         &mut (*gc.inner).data
     }
 }
@@ -306,7 +306,7 @@ impl<T: Hash> Hash for Gc<T> {
         self.as_ref().hash(state);
     }
 }
-impl<T:Serialize> Serialize for Gc<T>{
+impl<T: Serialize> Serialize for Gc<T> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -320,19 +320,17 @@ pub fn create_context() -> *mut GcContext {
         queue: VecDeque::new(),
     }))
 }
-pub fn destroy_context() {
-    unsafe {
-        let context = Box::from_raw(context());
-        drop(context);
-        GC.with(|gc| {
-            gc.set(std::ptr::null_mut());
-        });
-    }
+pub unsafe fn destroy_context() {
+    let context = Box::from_raw(context());
+    drop(context);
+    GC.with(|gc| {
+        gc.set(std::ptr::null_mut());
+    });
 }
 pub fn context() -> *mut GcContext {
     GC.with(|gc| gc.get())
 }
-pub fn init_context(ctx: *mut GcContext) {
+pub fn set_context(ctx: *mut GcContext) {
     GC.with(|gc| {
         assert!(gc.get().is_null());
         gc.set(ctx);
@@ -358,7 +356,7 @@ mod test {
     }
     #[test]
     fn basic() {
-        init_context(create_context());
+        set_context(create_context());
         let data = Rc::new(Cell::new(0));
         let foo = gc_new(Foo {
             data: data.clone(),
@@ -373,7 +371,7 @@ mod test {
     }
     #[test]
     fn basic2() {
-        init_context(create_context());
+        set_context(create_context());
         let data = Rc::new(Cell::new(0));
         let foo = gc_new(Foo {
             data: data.clone(),
