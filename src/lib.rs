@@ -26,7 +26,7 @@ impl<T> Gc<T> {
     pub fn eq(a: Self, b: Self) -> bool {
         a.inner == b.inner
     }
-    pub unsafe fn as_mut(gc:&Gc<T>) -> &mut T {
+    pub unsafe fn get_mut(gc:&Gc<T>) -> &mut T {
         &mut (*gc.inner).data
     }
 }
