@@ -1,3 +1,4 @@
+use parking_lot::{Mutex, RwLock};
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, HashMap, LinkedList, VecDeque},
@@ -5,12 +6,16 @@ use std::{
     fmt::Formatter,
     hash::Hash,
     ops::Deref,
+    ptr::NonNull,
     rc::Rc,
+    sync::atomic::{AtomicPtr, Ordering},
 };
 #[repr(C)]
 pub struct Gc<T> {
     pub(crate) inner: *mut GcObject<T>,
 }
+unsafe impl<T: Send> Send for GcObject<T> {}
+unsafe impl<T: Send> Sync for GcObject<T> {}
 impl<T> Clone for Gc<T> {
     fn clone(&self) -> Self {
         Self { inner: self.inner }
@@ -28,6 +33,16 @@ impl<T> Gc<T> {
     }
     pub unsafe fn get_mut(gc: &Gc<T>) -> &mut T {
         &mut (*gc.inner).data
+    }
+    pub fn set_root(gc: Self) {
+        unsafe {
+            mark_root(&mut (*gc.inner).header, true);
+        }
+    }
+    pub fn unset_root(gc: Self) {
+        unsafe {
+            mark_root(&mut (*gc.inner).header, false);
+        }
     }
 }
 impl<T> AsRef<T> for Gc<T> {
@@ -50,10 +65,11 @@ pub type DeleteFunc = fn(*mut u8);
 #[repr(C)]
 pub struct GcHeader {
     pub(crate) data: *mut u8,
-    pub(crate) next: *mut GcHeader,
+    pub(crate) next: AtomicPtr<GcHeader>,
     pub(crate) trace: TraceFunc,
     pub(crate) delete: DeleteFunc,
     pub(crate) mark: bool,
+    pub(crate) root: bool,
 }
 #[repr(C)]
 pub struct GcObject<T> {
@@ -65,20 +81,24 @@ pub trait Trace {
     fn trace(&self);
 }
 pub struct GcContext {
-    head: *mut GcHeader,
+    head: AtomicPtr<GcHeader>,
     queue: VecDeque<*mut GcHeader>,
 }
-thread_local! {
-    static GC: Cell<*mut GcContext> = Cell::new(std::ptr::null_mut());
-}
+pub struct GcContextPtr(NonNull<GcContext>);
+unsafe impl Send for GcContextPtr {}
+unsafe impl Sync for GcContextPtr {}
+
+static GC: RwLock<Option<GcContextPtr>> = RwLock::new(None);
+
 pub fn gc_alloc<T>(data: T, trace_fn: TraceFunc) -> *mut GcObject<T> {
     let object = Box::into_raw(Box::new(GcObject {
         header: GcHeader {
-            next: std::ptr::null_mut(),
+            next: AtomicPtr::new(std::ptr::null_mut()),
             mark: false,
             trace: trace_fn,
             delete: delete_impl::<T>,
             data: std::ptr::null_mut(),
+            root: false,
         },
         data,
     }));
@@ -89,11 +109,23 @@ pub fn gc_alloc<T>(data: T, trace_fn: TraceFunc) -> *mut GcObject<T> {
     object
 }
 pub fn gc_append_object(object: *mut GcHeader) {
-    let mut gc = GC.with(|gc| unsafe { gc.get().as_mut().unwrap() });
-    unsafe {
-        (*object).next = gc.head;
+    let gc = GC.read();
+    let gc = unsafe { gc.as_ref().unwrap().0.as_ref() };
+    loop {
+        let cur = gc.head.load(Ordering::Relaxed);
+        match gc
+            .head
+            .compare_exchange_weak(cur, object, Ordering::SeqCst, Ordering::Relaxed)
+        {
+            Ok(_) => {
+                unsafe {
+                    (*object).next.store(cur, Ordering::SeqCst);
+                }
+                break;
+            }
+            Err(_) => {}
+        }
     }
-    gc.head = object;
 }
 fn trace_impl<T: Trace>(data: *mut u8) {
     let obj = unsafe { &*(data as *const T) };
@@ -105,16 +137,20 @@ fn delete_impl<T>(data: *mut u8) {
         drop(Box::from_raw(object));
     }
 }
+pub unsafe fn mark_root(header: *mut GcHeader, root: bool) {
+    (*header).root = root;
+}
 pub unsafe fn trace_object(header: *mut GcHeader) {
     let header = &mut *header;
     if header.mark {
         return;
     }
     header.mark = true;
-    GC.with(|gc| {
-        let gc = gc.get().as_mut().unwrap();
+    {
+        let mut gc = GC.write();
+        let gc = gc.as_mut().unwrap().0.as_mut();
         gc.queue.push_back(header);
-    });
+    }
 }
 pub fn gc_new<T: Trace>(data: T) -> Gc<T> {
     let object = gc_alloc(data, trace_impl::<T>);
@@ -123,47 +159,49 @@ pub fn gc_new<T: Trace>(data: T) -> Gc<T> {
     }
     Gc { inner: object }
 }
-pub fn mark_root<T: Trace>(gc: Gc<T>) {
-    unsafe {
-        let header = &mut (*gc.inner).header;
-        if !header.mark {
-            header.mark = true;
-            GC.with(|gc| {
-                let gc = gc.get().as_mut().unwrap();
-                gc.queue.push_back(header);
-            });
-        }
-    }
-}
-pub unsafe fn clear_marks() {
-    let gc = GC.with(|gc| gc.get().as_mut().unwrap());
-    let mut header = gc.head;
+
+unsafe fn _clear_marks() {
+    let mut gc = GC.write();
+    let gc = gc.as_mut().unwrap().0.as_mut();
+    let mut header = gc.head.load(Ordering::Relaxed);
     while !header.is_null() {
-        (*header).mark = false;
-        header = (*header).next;
+        let h = &mut *header;
+        h.mark = false;
+        if h.root {
+            gc.queue.push_back(header);
+        }
+        header = h.next.load(Ordering::Relaxed);
     }
 }
-pub unsafe fn collect() {
-    GC.with(|gc| loop {
-        let queue = &mut gc.get().as_mut().unwrap().queue;
-        if queue.is_empty() {
-            break;
+
+unsafe fn _collect() {
+    {
+        let mut queue = VecDeque::new();
+        loop {
+            if queue.is_empty() {
+                let mut gc = GC.write();
+                let gc = gc.as_mut().unwrap().0.as_mut();
+                queue = std::mem::replace(&mut gc.queue, VecDeque::new());
+            }
+            if queue.is_empty() {
+                break;
+            }
+            let header = queue.pop_front().unwrap();
+            ((*header).trace)((*header).data);
         }
-        let header = queue.pop_front().unwrap();
-        drop(queue);
-        ((*header).trace)((*header).data);
-    });
-    let gc = GC.with(|gc| gc.get().as_mut().unwrap());
-    let mut cur = gc.head;
+    }
+    let mut gc = GC.write();
+    let gc = gc.as_mut().unwrap().0.as_mut();
+    let mut cur = gc.head.load(Ordering::Relaxed);
     let mut prev: *mut GcHeader = std::ptr::null_mut();
     while !cur.is_null() {
-        let next = (*cur).next;
+        let next = (*cur).next.load(Ordering::Relaxed);
         if !(*cur).mark {
             ((*cur).delete)(cur as *mut u8);
             if let Some(prev) = prev.as_mut() {
-                (*prev).next = next;
+                (*prev).next.store(next, Ordering::SeqCst);
             } else {
-                gc.head = next;
+                gc.head.store(next, Ordering::SeqCst);
             }
         } else {
             prev = cur;
@@ -171,10 +209,11 @@ pub unsafe fn collect() {
         cur = next;
     }
 }
-pub unsafe fn trace_and_collect(f: impl FnOnce()) {
-    clear_marks();
-    f();
-    collect();
+static LOCK: Mutex<()> = Mutex::new(());
+pub unsafe fn collect() {
+    let _lk = LOCK.lock();
+    _clear_marks();
+    _collect();
 }
 
 macro_rules! impl_trivial {
@@ -318,25 +357,25 @@ impl<T: Serialize> Serialize for Gc<T> {
 }
 pub fn create_context() -> *mut GcContext {
     Box::into_raw(Box::new(GcContext {
-        head: std::ptr::null_mut(),
+        head: AtomicPtr::new(std::ptr::null_mut()),
         queue: VecDeque::new(),
     }))
 }
 pub unsafe fn destroy_context() {
     let context = Box::from_raw(context());
     drop(context);
-    GC.with(|gc| {
-        gc.set(std::ptr::null_mut());
-    });
+    *GC.write() = None;
 }
 pub fn context() -> *mut GcContext {
-    GC.with(|gc| gc.get())
+    let gc = GC.read();
+    gc.as_ref()
+        .map(|gc| gc.0.as_ptr())
+        .unwrap_or(std::ptr::null_mut())
 }
 pub fn set_context(ctx: *mut GcContext) {
-    GC.with(|gc| {
-        assert!(gc.get().is_null());
-        gc.set(ctx);
-    });
+    let mut gc = GC.write();
+    assert!(gc.is_none());
+    *gc = Some(GcContextPtr(NonNull::new(ctx).unwrap()));
 }
 #[cfg(test)]
 mod test {
@@ -356,9 +395,13 @@ mod test {
             self.data.set(self.data.get() + 1);
         }
     }
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
     #[test]
     fn basic() {
-        set_context(create_context());
+        let _lk = TEST_LOCK.lock();
+        if context().is_null() {
+            set_context(create_context());
+        }
         let data = Rc::new(Cell::new(0));
         let foo = gc_new(Foo {
             data: data.clone(),
@@ -367,13 +410,19 @@ mod test {
         foo.next.set(Some(foo));
         std::mem::drop(foo);
         unsafe {
-            trace_and_collect(|| {});
+            collect();
         }
         assert_eq!(data.get(), 1, "{:?}", foo);
+        unsafe {
+            destroy_context();
+        }
     }
     #[test]
     fn basic2() {
-        set_context(create_context());
+        let _lk = TEST_LOCK.lock();
+        if context().is_null() {
+            set_context(create_context());
+        }
         let data = Rc::new(Cell::new(0));
         let foo = gc_new(Foo {
             data: data.clone(),
@@ -384,11 +433,10 @@ mod test {
             next: Cell::new(Some(foo)),
         });
         foo.next.set(Some(bar));
-        unsafe {
-            trace_and_collect(|| {
-                mark_root(foo);
-            });
-        }
+        Gc::set_root(foo);
         assert_eq!(data.get(), 0);
+        unsafe {
+            destroy_context();
+        }
     }
 }
