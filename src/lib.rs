@@ -30,6 +30,12 @@ impl<T: Trace> Gc<T> {
     }
 }
 impl<T> Gc<T> {
+    pub fn into_raw(self) -> *mut GcObject<T> {
+        self.inner
+    }
+    pub unsafe fn from_raw(ptr: *mut GcObject<T>) -> Self {
+        Self { inner: ptr }
+    }
     pub fn eq(a: Self, b: Self) -> bool {
         a.inner == b.inner
     }
