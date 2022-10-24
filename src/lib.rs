@@ -15,7 +15,9 @@ pub struct Gc<T> {
     pub(crate) inner: *mut GcObject<T>,
 }
 unsafe impl<T: Send> Send for GcObject<T> {}
-unsafe impl<T: Send> Sync for GcObject<T> {}
+unsafe impl<T: Sync> Sync for GcObject<T> {}
+unsafe impl<T: Send> Send for Gc<T> {}
+unsafe impl<T: Sync> Sync for Gc<T> {}
 impl<T> Clone for Gc<T> {
     fn clone(&self) -> Self {
         Self { inner: self.inner }
