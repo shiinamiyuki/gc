@@ -30,6 +30,9 @@ impl<T: Trace> Gc<T> {
     }
 }
 impl<T> Gc<T> {
+    pub fn null() -> Self {
+        Self { inner: std::ptr::null_mut() }
+    }
     pub fn into_raw(self) -> *mut GcObject<T> {
         self.inner
     }
