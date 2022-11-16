@@ -3,7 +3,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, HashMap, LinkedList, VecDeque},
     ffi::CString,
-    fmt::Formatter,
+    fmt::{Display, Formatter},
     hash::Hash,
     ops::Deref,
     ptr::NonNull,
@@ -31,7 +31,9 @@ impl<T: Trace> Gc<T> {
 }
 impl<T> Gc<T> {
     pub fn null() -> Self {
-        Self { inner: std::ptr::null_mut() }
+        Self {
+            inner: std::ptr::null_mut(),
+        }
     }
     pub fn into_raw(self) -> *mut GcObject<T> {
         self.inner
@@ -364,6 +366,11 @@ impl<T: Serialize> Serialize for Gc<T> {
         S: Serializer,
     {
         self.as_ref().serialize(serializer)
+    }
+}
+impl<T: Display> Display for Gc<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        self.as_ref().fmt(f)
     }
 }
 pub fn create_context() -> *mut GcContext {
