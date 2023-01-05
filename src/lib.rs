@@ -38,6 +38,9 @@ impl<T> Gc<T> {
     pub fn into_raw(self) -> *mut GcObject<T> {
         self.inner
     }
+    pub fn as_ptr(gc:Gc<T>) -> *mut T {
+        unsafe { &mut (*gc.inner).data }
+    }
     pub unsafe fn from_raw(ptr: *mut GcObject<T>) -> Self {
         Self { inner: ptr }
     }
